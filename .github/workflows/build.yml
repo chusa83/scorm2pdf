@@ -2,8 +2,11 @@ name: Build apps
 
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
+    inputs:
+      version:
+        description: "Release version tag, for example v1.0.1"
+        required: true
+        default: "v1.0.0"
 
 jobs:
   build:
@@ -36,3 +39,32 @@ jobs:
           path: |
             dist/SCORM2PDF.exe
             dist/SCORM2PDF_macos.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release_files
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: SCORM2PDF ${{ inputs.version }}
+          body: |
+            Desktop app that rebuilds a SCORM or IMS Common Cartridge course (.imscc, .zip) as a single PDF.
+
+            Downloads
+            - Windows: SCORM2PDF.exe
+            - macOS (Apple Silicon): SCORM2PDF_macos.zip
+
+            First launch warnings (the apps are not code signed)
+            - Windows: if SmartScreen says "Windows protected your PC", click More info, then Run anyway.
+            - macOS: unzip, right click SCORM2PDF, choose Open, then confirm Open.
+          files: |
+            release_files/SCORM2PDF.exe
+            release_files/SCORM2PDF_macos.zip
