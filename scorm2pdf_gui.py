@@ -13,6 +13,7 @@ import os
 import posixpath
 import queue
 import re
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -20,7 +21,9 @@ import threading
 import traceback
 import zipfile
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote, unquote_to_bytes
+from urllib.error import HTTPError
+from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -56,6 +59,9 @@ BLOCK = {"p", "div", "section", "article", "header", "footer", "main", "aside",
          "td", "th", "tbody", "thead", "tfoot", "caption", "address", "fieldset",
          "legend", "body", "html", "center", "form"}
 TAG_RE = re.compile(r"<(/?)(b|i|u|super|sub|strike|font|a)\b[^>]*>")
+YT_RE = re.compile(r"(?:youtube(?:-nocookie)?\.com/(?:embed/|v/|shorts/|live/|watch\?(?:[^#]*&)?v=)"
+                   r"|youtu\.be/)([\w-]{11})", re.I)
+VIMEO_RE = re.compile(r"vimeo\.com/(?:video/)?(\d+)", re.I)
 
 
 def local(tag):
@@ -88,6 +94,73 @@ def balance(markup):
     while stack:
         out.append("</%s>" % stack.pop())
     return "".join(out)
+
+
+def video_link(url):
+    """Returns (kind, clean url) for YouTube and Vimeo, or (None, url) for anything else."""
+    m = YT_RE.search(url)
+    if m:
+        if m.group(1) == "videoseries":
+            q = re.search(r"list=([\w-]+)", url)
+            if q:
+                return "YouTube playlist", "https://www.youtube.com/playlist?list=" + q.group(1)
+            return "YouTube", url
+        return "YouTube", "https://www.youtube.com/watch?v=" + m.group(1)
+    m = VIMEO_RE.search(url)
+    if m:
+        return "Vimeo", "https://vimeo.com/" + m.group(1)
+    return None, url
+
+
+def link_markup(url):
+    """Visible and clickable URL for a Paragraph."""
+    return '<a href="%s" color="blue">%s</a>' % (escape(url, {'"': "&quot;"}), escape(url))
+
+
+class Fetcher:
+    """Downloads public images from the web. A cache and a per host failure count
+    keep it fast when the same image repeats or a site is unreachable."""
+    MAX_BYTES = 10 * 1024 * 1024
+    TIMEOUT = 8
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+        self.cache = {}
+        self.fails = {}
+        try:
+            import certifi
+            self.ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            self.ctx = ssl.create_default_context()
+
+    def get(self, url):
+        """Returns (bytes, None) on success or (None, reason) on failure."""
+        if not self.enabled:
+            return None, "online images are turned off"
+        if url in self.cache:
+            return self.cache[url]
+        host = urlparse(url).netloc.lower()
+        if self.fails.get(host, 0) >= 2:
+            return None, "site not reachable"
+        try:
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0 (SCORM2PDF)"})
+            with urlopen(req, timeout=self.TIMEOUT, context=self.ctx) as r:
+                ctype = r.headers.get_content_type()
+                if ctype.startswith("text/"):
+                    result = (None, "not an image (%s), it may need a login" % ctype)
+                else:
+                    data = r.read(self.MAX_BYTES + 1)
+                    if len(data) > self.MAX_BYTES:
+                        result = (None, "file larger than 10 MB")
+                    else:
+                        result = (data, None)
+        except HTTPError as e:
+            result = (None, "HTTP error %d" % e.code)
+        except Exception as e:
+            self.fails[host] = self.fails.get(host, 0) + 1
+            result = (None, "download failed (%s)" % type(e).__name__)
+        self.cache[url] = result
+        return result
 
 
 # ---------------------------------------------------------------- fonts and styles
@@ -165,6 +238,7 @@ class Package:
         if not zipfile.is_zipfile(path):
             raise ValueError("This file is not a valid zip. A .imscc or SCORM package is a zip archive.")
         self.zf = zipfile.ZipFile(path)
+        self.fetcher = Fetcher()
         names = [n for n in self.zf.namelist() if not n.endswith("/")]
         manifest = [n for n in names if posixpath.basename(n).lower() == "imsmanifest.xml"]
         if not manifest:
@@ -368,6 +442,12 @@ class Renderer:
             self.buf.append('<a href="%s" color="blue">' % escape(href, {'"': "&quot;"}))
             self.render(a)
             self.buf.append("</a>")
+            # A link to a video must show its address in the text, because a PDF
+            # reader (or an AI) only sees the clickable area, not the hidden URL.
+            kind, clean = video_link(href)
+            shown = a.get_text(" ", strip=True)
+            if kind and clean not in shown and href not in shown:
+                self.buf.append(" (%s)" % link_markup(clean))
             return
         if href and not href.startswith("#"):
             ext = posixpath.splitext(re.split(r"[?#]", href)[0])[1].lower()
@@ -384,33 +464,59 @@ class Renderer:
         if not src:
             s = el.find("source")
             src = (s.get("src") if s else "") or ""
+        src = src.strip()
+        if src.startswith("//"):
+            src = "https:" + src
         self.flush()
+        if re.match(r"https?://", src, re.I):
+            kind, url = video_link(src)
+            if kind:
+                label = "Video (%s)" % kind
+            elif el.name == "iframe" or el.name in ("embed", "object"):
+                label = "Embedded content"
+            else:
+                label = el.name.capitalize() + " file"
+            title = (el.get("title") or "").strip()
+            line = "<b>%s:</b> %s%s" % (label, escape(title) + " " if title else "",
+                                        link_markup(url))
+            self.flows.append(Paragraph(line, self.S["body"]))
+            self.chars += len(label) + len(url)
+            return
         label = "[Embedded %s%s]" % (el.name, ": " + src if src else "")
         self.flows.append(Paragraph(escape(label), self.S["note"]))
+        self.chars += len(label)
         self.note("Embedded content, not included", "%s %s" % (el.name, src))
 
     def load(self, src):
+        """Returns (bytes, None) on success or (None, reason) on failure."""
         if src.startswith("data:"):
             m = re.match(r"data:[^,]*?(;base64)?,(.*)$", src, re.S)
             if not m:
-                return None
+                return None, "unreadable data address"
             try:
-                return base64.b64decode(m.group(2)) if m.group(1) else unquote_to_bytes(m.group(2))
+                data = base64.b64decode(m.group(2)) if m.group(1) else unquote_to_bytes(m.group(2))
+                return data, None
             except Exception:
-                return None
+                return None, "unreadable data address"
+        if src.startswith("//"):
+            src = "https:" + src
+        if re.match(r"https?:", src, re.I):
+            return self.pkg.fetcher.get(src)
         if re.match(r"[a-z][a-z0-9+.\-]*:", src, re.I):
-            return None
+            return None, "unsupported address type"
         full = self.pkg.resolve(self.base_dir, src)
-        return self.pkg.read(full) if full else None
+        if not full:
+            return None, "not found in the package"
+        return self.pkg.read(full), None
 
     def image(self, el):
         src = (el.get("src") or "").strip()
         alt = (el.get("alt") or "").strip()
-        data = self.load(src)
+        data, why = self.load(src)
         if data is None:
-            remote = re.match(r"https?:", src, re.I)
+            remote = bool(re.match(r"(https?:)?//", src, re.I))
             self.note("Remote image, not included" if remote else "Image not found",
-                      src[:120] or "(no src)")
+                      "%s (%s)" % (src[:120] or "no src", why))
             if alt:
                 self.buf.append(escape("[Image: %s]" % alt))
             return
@@ -424,6 +530,8 @@ class Renderer:
                 im = bg
             else:
                 im = im.convert("RGB")
+            if max(im.size) > 1600:
+                im.thumbnail((1600, 1600))  # keeps the PDF small, still sharp on screen
             w, h = im.size
             if w < 4 or h < 4:
                 return
@@ -541,7 +649,8 @@ def xml_to_html(data):
         if text and (" " in text or name in ("text", "description", "url")):
             parts.append(text if "<" in text else "<p>%s</p>" % escape(text))
         if name in ("url", "link", "weblink") and el.get("href"):
-            parts.append("<p>Link: %s</p>" % escape(el.get("href")))
+            parts.append('<p>Link: <a href="%s">%s</a></p>'
+                         % (escape(el.get("href"), {'"': "&quot;"}), escape(el.get("href"))))
     return "".join(parts)
 
 
@@ -635,11 +744,12 @@ def footer(canvas, doc):
     canvas.restoreState()
 
 
-def build(src, out, log=print, progress=None):
+def build(src, out, log=print, progress=None, online=True):
     """Converts the package at src into a PDF at out. Returns a summary dict.
 
     progress(done, total, phase) is called after each item ("read") and once
-    more when the PDF layout starts ("build").
+    more when the PDF layout starts ("build"). With online=True, public images
+    referenced by web address are downloaded and embedded.
     """
     def report_progress(done, total, phase):
         if progress:
@@ -647,6 +757,8 @@ def build(src, out, log=print, progress=None):
 
     log("Reading package: %s" % src)
     pkg = Package(src)
+    pkg.fetcher.enabled = online
+    log("Online images: %s" % ("will be downloaded" if online else "turned off"))
     regular, bold, mono = setup_fonts()
     styles = make_styles(regular, bold, mono)
     maxw = A4[0] - 4 * cm
@@ -713,6 +825,7 @@ def run_gui():
             self.minsize(620, 440)
             self.src = tk.StringVar()
             self.out = tk.StringVar()
+            self.online = tk.BooleanVar(value=True)
             self.q = queue.Queue()
             self.last_pdf = None
             self.busy = False
@@ -720,7 +833,7 @@ def run_gui():
             frame = ttk.Frame(self, padding=14)
             frame.pack(fill="both", expand=True)
             frame.columnconfigure(1, weight=1)
-            frame.rowconfigure(4, weight=1)
+            frame.rowconfigure(5, weight=1)
 
             ttk.Label(frame, text="Course package (.imscc or .zip)").grid(
                 row=0, column=0, columnspan=3, sticky="w")
@@ -733,14 +846,19 @@ def run_gui():
                 row=3, column=0, columnspan=2, sticky="ew", padx=(0, 8), pady=(2, 10))
             ttk.Button(frame, text="Browse...", command=self.pick_out).grid(row=3, column=2)
 
+            ttk.Checkbutton(
+                frame, variable=self.online,
+                text="Download images that live on the web (needs internet, slower)").grid(
+                row=4, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
             self.log = tk.Text(frame, height=12, wrap="word", state="disabled")
-            self.log.grid(row=4, column=0, columnspan=2, sticky="nsew")
+            self.log.grid(row=5, column=0, columnspan=2, sticky="nsew")
             sb = ttk.Scrollbar(frame, command=self.log.yview)
-            sb.grid(row=4, column=2, sticky="ns")
+            sb.grid(row=5, column=2, sticky="ns")
             self.log.configure(yscrollcommand=sb.set)
 
             bar = ttk.Frame(frame)
-            bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+            bar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(10, 0))
             bar.columnconfigure(2, weight=1)
             self.btn = ttk.Button(bar, text="Convert to PDF", command=self.convert)
             self.btn.grid(row=0, column=0)
@@ -751,7 +869,7 @@ def run_gui():
             self.progress.grid(row=0, column=2, sticky="ew", padx=(8, 0))
             self.status = tk.StringVar(value="Ready")
             ttk.Label(frame, textvariable=self.status).grid(
-                row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             self.write("Choose a course package, then click Convert to PDF.\n")
             self.after(100, self.poll)
@@ -795,14 +913,16 @@ def run_gui():
             self.progress.configure(mode="determinate", value=0)
             self.status.set("Reading package...")
             self.write("\n--- Starting conversion ---\n")
-            threading.Thread(target=self.worker, args=(src, out), daemon=True).start()
+            threading.Thread(target=self.worker, args=(src, out, self.online.get()),
+                             daemon=True).start()
 
-        def worker(self, src, out):
+        def worker(self, src, out, online):
             try:
                 result = build(
                     src, out,
                     log=lambda m: self.q.put(("log", m)),
-                    progress=lambda d, t, ph: self.q.put(("progress", (d, t, ph))))
+                    progress=lambda d, t, ph: self.q.put(("progress", (d, t, ph))),
+                    online=online)
                 self.q.put(("done", result))
             except Exception as e:
                 detail = str(e) if isinstance(e, ValueError) else traceback.format_exc()
