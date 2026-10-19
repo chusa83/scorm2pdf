@@ -635,8 +635,16 @@ def footer(canvas, doc):
     canvas.restoreState()
 
 
-def build(src, out, log=print):
-    """Converts the package at src into a PDF at out. Returns a summary dict."""
+def build(src, out, log=print, progress=None):
+    """Converts the package at src into a PDF at out. Returns a summary dict.
+
+    progress(done, total, phase) is called after each item ("read") and once
+    more when the PDF layout starts ("build").
+    """
+    def report_progress(done, total, phase):
+        if progress:
+            progress(done, total, phase)
+
     log("Reading package: %s" % src)
     pkg = Package(src)
     regular, bold, mono = setup_fonts()
@@ -671,6 +679,7 @@ def build(src, out, log=print):
                 rendered += 1
             except Exception as e:
                 report.append((it["title"], "Error reading resource", repr(e)))
+        report_progress(n, len(items), "read")
     story.append(PageBreak())
     story.append(heading("Extraction report", 0, styles))
     if not report:
@@ -683,6 +692,7 @@ def build(src, out, log=print):
         line = escape(kind) + (": " + escape(detail) if detail else "")
         story.append(Paragraph("• " + line, styles["note"]))
     log("Building PDF...")
+    report_progress(len(items), len(items), "build")
     doc = Doc(out, pagesize=A4, leftMargin=2 * cm, rightMargin=2 * cm,
               topMargin=2 * cm, bottomMargin=2 * cm, title=title)
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
@@ -737,8 +747,11 @@ def run_gui():
             self.open_btn = ttk.Button(bar, text="Open PDF", command=self.open_pdf,
                                        state="disabled")
             self.open_btn.grid(row=0, column=1, padx=8)
-            self.progress = ttk.Progressbar(bar, mode="indeterminate")
+            self.progress = ttk.Progressbar(bar, mode="determinate", maximum=100)
             self.progress.grid(row=0, column=2, sticky="ew", padx=(8, 0))
+            self.status = tk.StringVar(value="Ready")
+            ttk.Label(frame, textvariable=self.status).grid(
+                row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             self.write("Choose a course package, then click Convert to PDF.\n")
             self.after(100, self.poll)
@@ -778,13 +791,18 @@ def run_gui():
             self.last_pdf = None
             self.btn.configure(state="disabled")
             self.open_btn.configure(state="disabled")
-            self.progress.start(12)
+            self.progress.stop()
+            self.progress.configure(mode="determinate", value=0)
+            self.status.set("Reading package...")
             self.write("\n--- Starting conversion ---\n")
             threading.Thread(target=self.worker, args=(src, out), daemon=True).start()
 
         def worker(self, src, out):
             try:
-                result = build(src, out, log=lambda m: self.q.put(("log", m)))
+                result = build(
+                    src, out,
+                    log=lambda m: self.q.put(("log", m)),
+                    progress=lambda d, t, ph: self.q.put(("progress", (d, t, ph))))
                 self.q.put(("done", result))
             except Exception as e:
                 detail = str(e) if isinstance(e, ValueError) else traceback.format_exc()
@@ -796,6 +814,8 @@ def run_gui():
                     kind, payload = self.q.get_nowait()
                     if kind == "log":
                         self.write(payload + "\n")
+                    elif kind == "progress":
+                        self.on_progress(*payload)
                     elif kind == "done":
                         self.finish(payload)
                     else:
@@ -804,8 +824,19 @@ def run_gui():
                 pass
             self.after(100, self.poll)
 
+        def on_progress(self, done, total, phase):
+            if phase == "read":
+                self.progress.configure(mode="determinate", value=90.0 * done / max(total, 1))
+                self.status.set("Reading item %d of %d" % (done, total))
+            else:
+                self.status.set("Building PDF, this can take a moment...")
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(15)
+
         def finish(self, result):
             self.progress.stop()
+            self.progress.configure(mode="determinate", value=100)
+            self.status.set("Finished")
             self.btn.configure(state="normal")
             self.busy = False
             self.last_pdf = result["out"]
@@ -821,9 +852,17 @@ def run_gui():
                     self.write("  • %s: %s%s\n" % (where, kind, (" (" + detail + ")") if detail else ""))
             else:
                 self.write("No issues found.\n")
+            message = "The PDF was created successfully.\n\n%s\n\n" % result["out"]
+            if report:
+                message += "%d item(s) need your attention. See the log or the end of the PDF.\n\n" % len(report)
+            message += "Open the PDF now?"
+            if messagebox.askyesno("Conversion finished", message):
+                self.open_pdf()
 
         def fail(self, detail):
             self.progress.stop()
+            self.progress.configure(mode="determinate", value=0)
+            self.status.set("Failed")
             self.btn.configure(state="normal")
             self.busy = False
             self.write("\nConversion failed:\n%s\n" % detail)
@@ -840,6 +879,7 @@ def run_gui():
             else:
                 subprocess.run(["xdg-open", path], check=False)
 
+    sys.setswitchinterval(0.001)  # keeps the window responsive while the worker thread runs
     if sys.platform.startswith("win"):
         try:
             import ctypes
