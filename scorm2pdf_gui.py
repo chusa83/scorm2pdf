@@ -37,6 +37,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (CondPageBreak, HRFlowable, Image, ListFlowable,
                                 ListItem, PageBreak, Paragraph, Preformatted,
                                 SimpleDocTemplate, Spacer, Table, TableStyle)
+from svglib.svglib import svg2rlg
 
 APP_TITLE = "SCORM / IMSCC to PDF"
 XML_BASE = "{http://www.w3.org/XML/1998/namespace}base"
@@ -62,6 +63,9 @@ TAG_RE = re.compile(r"<(/?)(b|i|u|super|sub|strike|font|a)\b[^>]*>")
 YT_RE = re.compile(r"(?:youtube(?:-nocookie)?\.com/(?:embed/|v/|shorts/|live/|watch\?(?:[^#]*&)?v=)"
                    r"|youtu\.be/)([\w-]{11})", re.I)
 VIMEO_RE = re.compile(r"vimeo\.com/(?:video/)?(\d+)", re.I)
+BG_URL_RE = re.compile(r"background(?:-image)?\s*:[^;}]*?url\(\s*['\"]?([^'\")]+?)['\"]?\s*\)", re.I)
+CSS_RULE_RE = re.compile(r"([^{}]+)\{([^{}]*)\}")
+BG_ATTR = "data-scorm2pdf-bg"
 
 
 def local(tag):
@@ -385,10 +389,14 @@ class Renderer:
         n = el.name
         if n in SKIP:
             return
+        bg = el.attrs.get(BG_ATTR)
+        if bg:
+            # 32 px floor: smaller backgrounds are bullets and icons, not content
+            self.image(bg[0], base_dir=bg[1], min_px=32)
         if n == "br":
             self.buf.append("<br/>")
         elif n == "img":
-            self.image(el)
+            self.image((el.get("src") or "").strip(), (el.get("alt") or "").strip())
         elif n in MEDIA:
             self.media(el)
         elif n == "a":
@@ -487,7 +495,7 @@ class Renderer:
         self.chars += len(label)
         self.note("Embedded content, not included", "%s %s" % (el.name, src))
 
-    def load(self, src):
+    def load(self, src, base_dir=None):
         """Returns (bytes, None) on success or (None, reason) on failure."""
         if src.startswith("data:"):
             m = re.match(r"data:[^,]*?(;base64)?,(.*)$", src, re.S)
@@ -504,21 +512,22 @@ class Renderer:
             return self.pkg.fetcher.get(src)
         if re.match(r"[a-z][a-z0-9+.\-]*:", src, re.I):
             return None, "unsupported address type"
-        full = self.pkg.resolve(self.base_dir, src)
+        full = self.pkg.resolve(self.base_dir if base_dir is None else base_dir, src)
         if not full:
             return None, "not found in the package"
         return self.pkg.read(full), None
 
-    def image(self, el):
-        src = (el.get("src") or "").strip()
-        alt = (el.get("alt") or "").strip()
-        data, why = self.load(src)
+    def image(self, src, alt="", base_dir=None, min_px=4):
+        data, why = self.load(src, base_dir)
         if data is None:
             remote = bool(re.match(r"(https?:)?//", src, re.I))
             self.note("Remote image, not included" if remote else "Image not found",
                       "%s (%s)" % (src[:120] or "no src", why))
             if alt:
                 self.buf.append(escape("[Image: %s]" % alt))
+            return
+        if b"<svg" in data[:4096].lower():
+            self.svg(data, src, alt, min_px)
             return
         try:
             im = PILImage.open(io.BytesIO(data))
@@ -533,7 +542,7 @@ class Renderer:
             if max(im.size) > 1600:
                 im.thumbnail((1600, 1600))  # keeps the PDF small, still sharp on screen
             w, h = im.size
-            if w < 4 or h < 4:
+            if w < min_px or h < min_px:
                 return
             out = io.BytesIO()
             im.save(out, "JPEG", quality=90)
@@ -547,6 +556,27 @@ class Renderer:
         scale = min(1.0, self.maxw / wpt, (20 * cm) / hpt)
         self.flush()
         self.flows.append(Image(out, width=wpt * scale, height=hpt * scale))
+        self.flows.append(Spacer(1, 4))
+        self.chars += 1
+
+    def svg(self, data, src, alt, min_px):
+        """Vector images stay vector: svglib turns them into a ReportLab drawing."""
+        try:
+            d = svg2rlg(io.BytesIO(data))
+        except Exception:
+            d = None
+        if d is None or not d.width or not d.height:
+            self.note("Unsupported image format", src[:120])
+            if alt:
+                self.buf.append(escape("[Image: %s]" % alt))
+            return
+        if d.width < min_px * 0.75 or d.height < min_px * 0.75:
+            return
+        scale = min(1.0, self.maxw / d.width, (20 * cm) / d.height)
+        d.scale(scale, scale)
+        d.width, d.height = d.width * scale, d.height * scale
+        self.flush()
+        self.flows.append(d)
         self.flows.append(Spacer(1, 4))
         self.chars += 1
 
@@ -625,8 +655,46 @@ class Renderer:
         self.flows.append(Spacer(1, 6))
 
 
+def mark_backgrounds(pkg, soup, base_dir):
+    """Finds CSS background images (style tags, stylesheets in the package, style
+    attributes) and marks the first element showing each one, for the Renderer."""
+    sheets = [(s.get_text(), base_dir) for s in soup.find_all("style")]
+    for link in soup.find_all("link", href=True):
+        if "stylesheet" in [r.lower() for r in link.get("rel") or []]:
+            full = pkg.resolve(base_dir, link["href"])
+            if full:
+                rel = full[len(pkg.root_dir) + 1:] if pkg.root_dir else full
+                sheets.append((pkg.read(full).decode("utf-8", "replace"), posixpath.dirname(rel)))
+    found = {}  # element id -> (url, folder the url is relative to); later rules win
+    for css, folder in sheets:
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+        for sel, body in CSS_RULE_RE.findall(css):
+            m = BG_URL_RE.search(body)
+            if not m:
+                continue
+            for s in sel.rsplit(";", 1)[-1].split(","):
+                s = s.strip()
+                if not s or ":" in s or s.startswith("@"):  # :hover, ::before, at-rules
+                    continue
+                try:
+                    for el in soup.select(s):
+                        found[id(el)] = (m.group(1), folder)
+                except Exception:
+                    continue
+    for el in soup.find_all(style=BG_URL_RE):
+        found[id(el)] = (BG_URL_RE.search(el["style"]).group(1), base_dir)
+    seen = set()
+    for el in soup.find_all(True):
+        bg = found.get(id(el))
+        # page backgrounds and repeats of the same picture are decoration
+        if bg and el.name not in ("html", "body") and bg[0] not in seen:
+            seen.add(bg[0])
+            el.attrs[BG_ATTR] = bg
+
+
 def render_html(pkg, content, base_dir, styles, mono, report, where, maxw):
     soup = BeautifulSoup(content, "html.parser")
+    mark_backgrounds(pkg, soup, base_dir)
     dynamic = bool(soup.find("script"))
     r = Renderer(pkg, base_dir, styles, mono, report, where, maxw)
     r.render(soup.body or soup)

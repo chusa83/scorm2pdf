@@ -5,6 +5,9 @@ Rebuilds a course from a SCORM or IMS Common Cartridge package (.imscc, .zip)
 as one PDF, in the teaching order of the package manifest.
 
 Images that live on the web (public addresses) are downloaded and embedded.
+SVG images are kept as sharp vector drawings. Pictures set as CSS backgrounds
+(in style attributes, <style> blocks or stylesheets inside the package) are
+included too; small icons, page backgrounds and repeated textures are skipped.
 YouTube and Vimeo videos, and other embedded content such as Google Slides,
 appear as clickable links in the text, in the same place they had in the course.
 The video itself is not included.
@@ -35,7 +38,7 @@ PyInstaller cannot build a Mac app on Windows or the reverse, so each system
 needs its own build.
 
 Run from source (needs Python with Tk):
-  pip install reportlab beautifulsoup4 pillow certifi
+  pip install reportlab beautifulsoup4 pillow certifi svglib
   python scorm2pdf_gui.py
 
 The bundled fonts in fonts/ are DejaVu fonts (free license, see DEJAVU_LICENSE.txt).
