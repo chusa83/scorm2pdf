@@ -39,7 +39,7 @@ FILES = {
     "img/page.png": png(100), "img/hover.png": png(100), "img/icon.png": png(16),
 }
 
-with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:  # build() leaves the zip open
+with tempfile.TemporaryDirectory() as tmp:
     path = os.path.join(tmp, "course.zip")
     with zipfile.ZipFile(path, "w") as zf:
         for name, data in FILES.items():
@@ -55,5 +55,6 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:  # build() 
     # banner (linked css), card once (not twice, not :hover), inline; not body or 16 px icon
     assert len(images) == 3, images
     assert not report, report
+    pkg.zf.close()
     app.build(path, os.path.join(tmp, "out.pdf"), log=lambda *a: None, online=False)
 print("ok")

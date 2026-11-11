@@ -825,41 +825,44 @@ def build(src, out, log=print, progress=None, online=True):
 
     log("Reading package: %s" % src)
     pkg = Package(src)
-    pkg.fetcher.enabled = online
-    log("Online images: %s" % ("will be downloaded" if online else "turned off"))
-    regular, bold, mono = setup_fonts()
-    styles = make_styles(regular, bold, mono)
-    maxw = A4[0] - 4 * cm
-    report = []
-    title = pkg.course_title() or os.path.splitext(os.path.basename(src))[0]
-    story = [Paragraph(escape(title), styles["H0"]),
-             Paragraph("Contents extracted in the order of the package manifest.",
-                       styles["note"]),
-             Spacer(1, 12)]
-    items = pkg.items()
-    log("Items found in manifest: %d" % len(items))
-    started = False
-    rendered = 0
-    for n, it in enumerate(items, 1):
-        log("[%d/%d] %s" % (n, len(items), it["title"]))
-        if it["depth"] == 0 and started:
-            story.append(PageBreak())
-        elif it["depth"] > 0:
-            story.append(CondPageBreak(4 * cm))
-        started = True
-        label = it["title"] + (" (hidden from students)" if it["hidden"] else "")
-        story.append(heading(label, it["depth"], styles))
-        if it["desc"]:
-            flows, _, _ = render_html(pkg, it["desc"], "", styles, mono, report,
-                                      it["title"], maxw)
-            story += flows
-        if it["ref"]:
-            try:
-                story += render_resource(pkg, it, styles, mono, report, maxw)
-                rendered += 1
-            except Exception as e:
-                report.append((it["title"], "Error reading resource", repr(e)))
-        report_progress(n, len(items), "read")
+    try:
+        pkg.fetcher.enabled = online
+        log("Online images: %s" % ("will be downloaded" if online else "turned off"))
+        regular, bold, mono = setup_fonts()
+        styles = make_styles(regular, bold, mono)
+        maxw = A4[0] - 4 * cm
+        report = []
+        title = pkg.course_title() or os.path.splitext(os.path.basename(src))[0]
+        story = [Paragraph(escape(title), styles["H0"]),
+                 Paragraph("Contents extracted in the order of the package manifest.",
+                           styles["note"]),
+                 Spacer(1, 12)]
+        items = pkg.items()
+        log("Items found in manifest: %d" % len(items))
+        started = False
+        rendered = 0
+        for n, it in enumerate(items, 1):
+            log("[%d/%d] %s" % (n, len(items), it["title"]))
+            if it["depth"] == 0 and started:
+                story.append(PageBreak())
+            elif it["depth"] > 0:
+                story.append(CondPageBreak(4 * cm))
+            started = True
+            label = it["title"] + (" (hidden from students)" if it["hidden"] else "")
+            story.append(heading(label, it["depth"], styles))
+            if it["desc"]:
+                flows, _, _ = render_html(pkg, it["desc"], "", styles, mono, report,
+                                          it["title"], maxw)
+                story += flows
+            if it["ref"]:
+                try:
+                    story += render_resource(pkg, it, styles, mono, report, maxw)
+                    rendered += 1
+                except Exception as e:
+                    report.append((it["title"], "Error reading resource", repr(e)))
+            report_progress(n, len(items), "read")
+    finally:
+        pkg.zf.close()  # releases the course file (Windows locks open files)
     story.append(PageBreak())
     story.append(heading("Extraction report", 0, styles))
     if not report:
